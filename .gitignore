@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build output
+build/
+build_onedir/
+build*/
+dist/
+dist*/
+release/
+release_staging/
+*.spec
+
+# Generated / private files
+output/
+preview/
+*.pdf
+*.png
+!docs/*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
