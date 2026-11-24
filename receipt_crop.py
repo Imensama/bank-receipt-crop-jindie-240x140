@@ -115,6 +115,89 @@ def _table_rows(drawings: list[Rect], page_width: float) -> list[Rect]:
     return rows
 
 
+def _table_bands(frames: list[Rect]) -> list[Rect]:
+    """Group overlapping frame lines into table blocks.
+
+    PSBC puts three receipts on one A4 page.  Each receipt has a table
+    border, but its footer is only ~17 pt above the next receipt's header,
+    so content clustering alone would merge all three.  The table frames
+    give reliable anchors for splitting them apart.
+    """
+    ordered = sorted(frames, key=lambda r: (r[1], r[0]))
+    groups: list[list[float]] = []
+    for rect in ordered:
+        if groups and rect[1] <= groups[-1][3] + 6.0:
+            group = groups[-1]
+            group[0] = min(group[0], rect[0])
+            group[1] = min(group[1], rect[1])
+            group[2] = max(group[2], rect[2])
+            group[3] = max(group[3], rect[3])
+        else:
+            groups.append([rect[0], rect[1], rect[2], rect[3]])
+
+    result: list[Rect] = []
+    for group in groups:
+        band = (group[0], group[1], group[2], group[3])
+        if band[3] - band[1] >= 30:
+            result.append(band)
+    return result
+
+
+def _split_clip_by_tables(
+    clip: Rect,
+    tables: list[Rect],
+    words: list[Rect],
+    images: list[Rect],
+    drawings: list[Rect],
+    page_width: float,
+    page_height: float,
+) -> list[Rect]:
+    """Split a merged multi-receipt clip at the boundaries between tables."""
+    boundaries = [
+        (tables[i][3] + tables[i + 1][1]) / 2.0
+        for i in range(len(tables) - 1)
+    ]
+
+    def group_index(rect: Rect) -> int | None:
+        center = (rect[1] + rect[3]) / 2.0
+        if center < clip[1] or center > clip[3]:
+            return None
+        index = 0
+        while index < len(boundaries) and center > boundaries[index]:
+            index += 1
+        return index
+
+    groups: list[list[Rect]] = [[] for _ in tables]
+    for rect in words + images + drawings:
+        if rect[3] - rect[1] >= page_height * 0.5:
+            continue
+        index = group_index(rect)
+        if index is not None:
+            groups[index].append(rect)
+
+    result: list[Rect] = []
+    for table, items in zip(tables, groups):
+        band = table
+        for rect in items:
+            band = _union(band, rect)
+        band = (
+            max(clip[0], band[0]),
+            max(clip[1], band[1]),
+            min(clip[2], band[2]),
+            min(clip[3], band[3]),
+        )
+        if band[2] - band[0] < 10 or band[3] - band[1] < 10:
+            continue
+        band = (
+            max(0.0, band[0] - CLIP_PAD_PT),
+            max(0.0, band[1] - CLIP_PAD_PT),
+            min(page_width, band[2] + CLIP_PAD_PT),
+            min(page_height, band[3] + CLIP_PAD_PT),
+        )
+        result.append(band)
+    return result
+
+
 def page_content_rects(
     page: pdfplumber.page.Page,
 ) -> tuple[list[Rect], list[Rect], list[Rect]]:
@@ -149,17 +232,44 @@ def page_content_rects(
         if rect[2] > rect[0] and rect[3] > rect[1]:
             images.append(rect)
 
-    words: list[Rect] = []
+    word_items: list[tuple[Rect, str]] = []
     for obj in page.extract_words():
+        text = str(obj.get("text", "")).strip()
         rect = (
             float(obj["x0"]),
             float(obj["top"]),
             float(obj["x1"]),
             float(obj["bottom"]),
         )
-        if rect[2] > rect[0] and rect[3] > rect[1]:
-            words.append(rect)
+        if rect[2] <= rect[0] or rect[3] <= rect[1]:
+            continue
+        if rect[2] <= 0 or rect[0] >= page_width or rect[3] <= 0 or rect[1] >= page_height:
+            continue
+        word_items.append((rect, text))
 
+    # PSBC draws the dashed separator between stacked receipts as many
+    # standalone "-" words.  Drop only runs of these dashes, not a single
+    # dash that may legitimately sit in a table cell.
+    dash_groups: dict[float, list[Rect]] = {}
+    for rect, text in word_items:
+        if text and set(text) <= {"-", "–", "—", "_"}:
+            key = round((rect[1] + rect[3]) / 2.0, 1)
+            dash_groups.setdefault(key, []).append(rect)
+
+    separator_rects: set[Rect] = set()
+    for group in dash_groups.values():
+        if len(group) < 5:
+            continue
+        left = min(r[0] for r in group)
+        right = max(r[2] for r in group)
+        if right - left >= page_width * 0.3:
+            separator_rects.update(group)
+
+    words = [
+        rect
+        for rect, _text in word_items
+        if rect not in separator_rects
+    ]
     return drawings, images, words
 
 
@@ -235,6 +345,30 @@ def find_receipt_clips(page: pdfplumber.page.Page) -> list[Rect]:
             min(page_height, band[3] + CLIP_PAD_PT),
         )
         clips.append(band)
+
+    tables = _table_bands(frames)
+    split_clips: list[Rect] = []
+    for clip in clips:
+        inside = [
+            table
+            for table in tables
+            if table[1] >= clip[1] - 2 and table[3] <= clip[3] + 2
+        ]
+        if len(inside) >= 2:
+            split_clips.extend(
+                _split_clip_by_tables(
+                    clip,
+                    inside,
+                    words,
+                    images,
+                    drawings,
+                    page_width,
+                    page_height,
+                )
+            )
+        else:
+            split_clips.append(clip)
+    clips = split_clips
 
     clips.sort(key=lambda r: (r[1], r[0]))
     return clips
